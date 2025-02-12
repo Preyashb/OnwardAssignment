@@ -1,0 +1,175 @@
+class CollisionFreePathPlanner : public PathPlannerInterface {
+public:
+    CollisionFreePathPlanner() {}
+
+    Trajectory getCollisionFreePath(const OccupancyGrid& grid,
+                                  const Eigen::Vector3f& start,
+                                  const Eigen::Vector3f& goal) override {
+        const float robot_radius = 0.3f;
+        const float sqrt2 = std::sqrt(2.0f);
+        const int NUM_ANGLE_BINS = 8;  // Discretize into 8 directions (45-degree increments)
+        
+        // Helper function to discretize angle to nearest 45-degree increment
+        auto discretizeAngle = [NUM_ANGLE_BINS](float theta) -> float {
+            // Normalize angle to [0, 2π)
+            theta = std::fmod(theta + 2.0f * M_PI, 2.0f * M_PI);
+            if (theta < 0) theta += 2.0f * M_PI;
+            
+            // Convert to discrete bin
+            int bin = static_cast<int>(std::round(theta * NUM_ANGLE_BINS / (2.0f * M_PI))) % NUM_ANGLE_BINS;
+            
+            // Convert back to angle
+            return bin * 2.0f * M_PI / NUM_ANGLE_BINS;
+        };
+        
+        struct Node {
+            Eigen::Vector3f position;
+            float cost;
+            float heuristic;
+            std::shared_ptr<Node> parent;
+            
+            float getTotalCost() const { return cost + heuristic; }
+        };
+        
+        struct NodeComparator {
+            bool operator()(const std::shared_ptr<Node>& a, const std::shared_ptr<Node>& b) {
+                return a->getTotalCost() > b->getTotalCost();
+            }
+        };
+        
+        auto getCurrentCell = [&grid](const Eigen::Vector3f& position) -> Eigen::Vector2i {
+            return Eigen::Vector2i(
+                static_cast<int>(std::floor(position.x() / grid.resolution_m)),
+                static_cast<int>(std::floor(position.y() / grid.resolution_m))
+            );
+        };
+
+        auto isOutOfBounds = [&grid](const Eigen::Vector2i &cell) -> bool
+        {
+          return cell.x() < 0 || cell.x() >= grid.width ||
+                 cell.y() < 0 || cell.y() >= grid.height;
+        };
+
+        auto calculateHeuristic = [](const Eigen::Vector3f& pos, const Eigen::Vector3f& goal) -> float {
+            return (pos.head<2>() - goal.head<2>()).norm() + 
+                   std::abs(std::remainder(pos.z() - goal.z(), 2.0f * M_PI)) * 0.05f; //reduces the weight of orientation differences in the heuristic
+        };
+
+        std::priority_queue<std::shared_ptr<Node>, 
+                          std::vector<std::shared_ptr<Node>>, 
+                          NodeComparator> open_set;
+                          
+        std::unordered_set<std::string> closed_set;
+        
+        /*auto getStateKey = [](const Eigen::Vector2i& cell, float theta, int NUM_ANGLE_BINS) -> std::string {
+            // Convert theta to discrete bin number for the key
+            int angle_bin = static_cast<int>(std::round(theta * NUM_ANGLE_BINS / (2.0f * M_PI))) % NUM_ANGLE_BINS;
+            return std::to_string(cell.x()) + "," + 
+                   std::to_string(cell.y()) + "," + 
+                   std::to_string(angle_bin);
+        };*/
+        //This method is faster than using to_string 
+        auto getStateKey = [](const Eigen::Vector2i& cell, float theta, int NUM_ANGLE_BINS) -> std::string {
+            int angle_bin = static_cast<int>(std::round(theta * NUM_ANGLE_BINS / (2.0f * M_PI))) % NUM_ANGLE_BINS;
+            return std::string(reinterpret_cast<const char*>(&cell.x()), sizeof(cell.x())) + "," + 
+                std::string(reinterpret_cast<const char*>(&cell.y()), sizeof(cell.y())) + "," + 
+                std::string(reinterpret_cast<const char*>(&angle_bin), sizeof(angle_bin));
+        };
+
+
+        // Discretize start and goal orientations
+        Eigen::Vector3f discretized_start = start;
+        discretized_start.z() = discretizeAngle(start.z());
+        
+        Eigen::Vector3f discretized_goal = goal;
+        discretized_goal.z() = discretizeAngle(goal.z());
+
+        auto start_node = std::make_shared<Node>(Node{
+            discretized_start, 
+            0.0f,
+            calculateHeuristic(discretized_start, discretized_goal),
+            nullptr
+        });
+        
+        open_set.push(start_node);
+
+        while (!open_set.empty()) {
+            auto current = open_set.top();
+            open_set.pop();
+
+            Eigen::Vector2i current_cell = getCurrentCell(current->position);
+            std::string state_key = getStateKey(current_cell, current->position.z(), NUM_ANGLE_BINS);
+            
+            if (closed_set.count(state_key)) {
+                continue;
+            }
+            
+            closed_set.insert(state_key);
+
+            // Check if we reached the goal
+            // Use discretized angles for comparison
+            float current_angle = discretizeAngle(current->position.z());
+            float goal_angle = discretizeAngle(discretized_goal.z());
+            
+            if ((current->position.head<2>() - discretized_goal.head<2>()).norm() < grid.resolution_m &&
+                std::abs(std::remainder(current_angle - goal_angle, 2.0f * M_PI)) < 0.1f) {
+                
+                Trajectory path;
+                auto node = current;
+                while (node) {
+                    path.push_back(node->position);
+                    node = node->parent;
+                }
+                std::reverse(path.begin(), path.end());
+                return path;
+            }
+
+            // Define discrete angle changes (45-degree increments)
+            const float angle_step = 2.0f * M_PI / NUM_ANGLE_BINS;
+            const float angle_changes[] = {-angle_step, 0.0f, angle_step};
+
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (float dtheta : angle_changes) {
+                        if (dx == 0 && dy == 0 && dtheta == 0) continue;
+
+                        Eigen::Vector2i neighbor_cell = current_cell + Eigen::Vector2i(dx, dy);
+                        
+                        if (isOutOfBounds(neighbor_cell)) continue;
+                        
+                        //Obstacle check
+                        int idx = grid.get1DIndex(neighbor_cell.x(), neighbor_cell.y());
+                        if (idx < 0 || grid.data[idx]) {
+                            //std::cout << "    Obstacle detected at (" << neighbor_cell.x() << ", " << neighbor_cell.y() << ")" << std::endl;
+                            continue;
+                        }
+
+                        float movement_cost = (dx == 0 && dy == 0) ? 0.1f :  // Pure rotation
+                                            (dx == 0 || dy == 0) ? 1.0f :    // Manhattan movement
+                                            sqrt2;                            // Diagonal movement
+                                            
+                        // Discretize the new angle
+                        float new_theta = discretizeAngle(current->position.z() + dtheta);
+                        
+                        Eigen::Vector3f neighbor_pos(
+                            neighbor_cell.x() * grid.resolution_m + grid.resolution_m/2,
+                            neighbor_cell.y() * grid.resolution_m + grid.resolution_m/2,
+                            new_theta
+                        );
+
+                        auto neighbor = std::make_shared<Node>(Node{
+                            neighbor_pos,
+                            current->cost + movement_cost,
+                            calculateHeuristic(neighbor_pos, discretized_goal),
+                            current
+                        });
+                        
+                        open_set.push(neighbor);
+                    }
+                }
+            }
+        }
+
+        return Trajectory();
+    }
+};
